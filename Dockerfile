@@ -4,8 +4,10 @@ FROM python:3.9-slim
 # 2. Set the working directory inside the container
 WORKDIR /app
 
+# This forces logs to show up immediately in the Render console
+ENV PYTHONUNBUFFERED=1
+
 # 3. Install system dependencies
-# These libraries (libgl1, etc.) are often required by PyTorch/Vision image tools
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
