@@ -1,67 +1,56 @@
 import os
-import io
 import torch
+import cv2
+import numpy as np
+import base64
 import torchvision.transforms as transforms
+from flask import Flask, request, jsonify
 from PIL import Image
 import torchvision.ops as ops
-from flask import Flask, request, jsonify
 
-# --- IMPORT YOUR CUSTOM MODULES ---
-# These imports work because model.py and utils.py are in the same folder
+# --- IMPORT YOUR MODULES ---
 from model import MobileNetRefineDetLiteCBAM
 from utils import AnchorGenerator, decode
 
 app = Flask(__name__)
 
 # --- CONFIGURATION ---
-MODEL_PATH = 'model.pth'  # You renamed recall_repair_epoch_10.pth to this
+MODEL_PATH = 'model.pth'
 IMG_SIZE = 512
-CONF_THRESHOLD = 0.40     # Only show strong results
-IOU_THRESHOLD = 0.30      # Overlap threshold for filtering
+CONF_THRESHOLD = 0.40
+IOU_THRESHOLD = 0.30
 
-# Class mapping (Must match your data.py training order exactly)
-CLASSES = [
-    '__background__', 
-    'battery_icon', 
-    'engine_icon', 
-    'oil_pressure_icon', 
-    'parking_brake_icon', 
-    'power_steering_icon'
-]
+# Classes (Must match data.py)
+CLASSES = ['__background__', 'battery_icon', 'engine_icon', 'oil_pressure_icon', 'parking_brake_icon', 'power_steering_icon']
 
-# --- 1. SETUP DEVICE ---
-# This ensures it works on Cloud Servers (CPU) and your Laptop (GPU)
+# Colors for Bounding Boxes (Same as evaluation.py)
+COLORS = np.random.uniform(0, 255, size=(len(CLASSES), 3))
+
+# Device Config
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"⚙️  Server starting on device: {DEVICE}")
+print(f"⚙️ Running on Device: {DEVICE}")
 
-# --- 2. LOAD MODEL ---
-print(f"🚀 Loading Model from {MODEL_PATH}...")
+# --- LOAD MODEL ---
+print(f"🚀 Loading Model...")
 model = MobileNetRefineDetLiteCBAM(num_classes=6).to(DEVICE)
 
 if os.path.exists(MODEL_PATH):
-    # map_location ensures the model loads onto CPU if GPU is missing
     model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
     model.eval()
-    print("✅ Model weights loaded successfully!")
+    print("✅ Model Loaded Successfully!")
 else:
-    print(f"❌ CRITICAL ERROR: {MODEL_PATH} not found in current directory.")
+    print(f"❌ Error: {MODEL_PATH} not found.")
 
-# --- 3. GENERATE ANCHORS ---
-# We generate these once at startup to save time
+# Generate Anchors
 anchor_gen = AnchorGenerator(IMG_SIZE)
 anchors = anchor_gen.forward(DEVICE)
 
-# --- 4. PREPROCESSING ---
-# Must match the transforms used in your training
+# Transform (Same as training)
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-
-@app.route('/', methods=['GET'])
-def home():
-    return "Diagnodash AI Server is Awake and Ready!", 200
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -71,70 +60,95 @@ def predict():
     file = request.files['file']
     
     try:
-        # A. Read Image
-        img_bytes = file.read()
-        img_pil = Image.open(io.BytesIO(img_bytes)).convert('RGB')
-        w_orig, h_orig = img_pil.size
+        # 1. READ IMAGE (OpenCV format)
+        file_bytes = np.frombuffer(file.read(), np.uint8)
+        orig_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+        h_orig, w_orig, _ = orig_image.shape
 
-        # B. Preprocess
+        # 2. PREPROCESS (Convert to PIL for Transform)
+        img_pil = Image.fromarray(cv2.cvtColor(orig_image, cv2.COLOR_BGR2RGB))
         input_tensor = transform(img_pil).unsqueeze(0).to(DEVICE)
 
-        # C. Inference
+        # 3. INFERENCE
         with torch.no_grad():
             arm_loc, arm_conf, odm_loc, odm_conf = model(input_tensor)
-            
-            # Convert confidence to probabilities
             odm_conf = torch.nn.functional.softmax(odm_conf, dim=2)
-            
-            # Decode boxes
             boxes = decode(odm_loc[0], anchors)
             
-            # Scale boxes back to original image size
+            # Scale boxes back to original image
             boxes[:, 0::2] *= w_orig
             boxes[:, 1::2] *= h_orig
 
-        # D. Process Results
         scores, labels = torch.max(odm_conf[0], dim=1)
 
-        # Filter: Confidence Threshold
+        # 4. FILTERING
         mask = scores > CONF_THRESHOLD
         boxes = boxes[mask]
         scores = scores[mask]
         labels = labels[mask]
 
-        # Filter: Remove Background Class (0)
+        # Remove Background
         mask_bg = labels > 0
         boxes = boxes[mask_bg]
         scores = scores[mask_bg]
         labels = labels[mask_bg]
 
+        detected_class_name = "default"
+        best_confidence = 0.0
+
         if boxes.size(0) > 0:
-            # E. Non-Maximum Suppression (NMS)
-            # Removes duplicate boxes for the same icon
+            # NMS
             keep_idx = ops.nms(boxes, scores, IOU_THRESHOLD)
             
-            # We take the single best detection
-            best_idx = keep_idx[0]
-            
-            detected_label = CLASSES[labels[best_idx].item()]
-            confidence = float(scores[best_idx].item())
-            
+            # Keep only the best boxes
+            final_boxes = boxes[keep_idx]
+            final_scores = scores[keep_idx]
+            final_labels = labels[keep_idx]
+
+            # Get the best detection for text response
+            best_idx = 0 
+            detected_class_name = CLASSES[final_labels[best_idx].item()]
+            best_confidence = float(final_scores[best_idx].item())
+
+            # --- DRAWING LOGIC (From evaluation.py) ---
+            for i in range(final_boxes.size(0)):
+                box = final_boxes[i].cpu().numpy().astype(int)
+                score = final_scores[i].item()
+                label_idx = final_labels[i].item()
+                
+                label_name = CLASSES[label_idx]
+                color = COLORS[label_idx]
+                
+                # Draw Box
+                cv2.rectangle(orig_image, (box[0], box[1]), (box[2], box[3]), color, 3)
+                
+                # Draw Text Label
+                text = f"{label_name} {score:.2f}"
+                cv2.putText(orig_image, text, (box[0], box[1]-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+
+            # --- ENCODE RESULT IMAGE TO BASE64 ---
+            # This turns the OpenCV image back into a string the app can read
+            _, buffer = cv2.imencode('.jpg', orig_image)
+            img_str = base64.b64encode(buffer).decode('utf-8')
+            result_image_base64 = f"data:image/jpeg;base64,{img_str}"
+
             return jsonify({
                 "success": True,
-                "detected_class": detected_label,
-                "confidence": confidence
+                "detected_class": detected_class_name,
+                "confidence": best_confidence,
+                "result_image": result_image_base64
             })
         else:
             return jsonify({
                 "success": False,
-                "message": "No warning light detected."
+                "message": "No specific warning light detected."
             })
 
     except Exception as e:
-        print(f"❌ Error during prediction: {e}")
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # Render and other clouds usually provide a PORT env variable
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
